@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Local SAM 3.1 weights — multi-GB.  Reminder text is kept in tree
+# (see code/model/COPY LOCAL MODEL HERE.txt) so users know what to put here.
+code/model/*
+!code/model/COPY LOCAL MODEL HERE.txt
+
+# User videos — typically large.  The folder itself is committed (with this
+# .gitignore) so the path exists for the default --video flag.
+data/input/*
+!data/input/.gitkeep
+
+# Saved annotated outputs from runs.  Empty dir kept for the default
+# --output-dir flag.
+data/output/*
+!data/output/.gitkeep

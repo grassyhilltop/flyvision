@@ -1,0 +1,13 @@
+Copy and paste the downloaded model weight flolder (e.g. Sam3) in this model folder here.
+
+Code looks in this folder for a custom model to use for detection
+
+
+Notes: 
+
+For this repo the model file is excluded for now due to its size and needs to be copied here manually.
+
+Tested with "sam3.1-bf16" folder which has a "model.safetensors" file and config.json inside.
+
+Note that downloading sam3 weights locally requires some permissions and authentication with a huggingface account before you can access the weights. 
+
