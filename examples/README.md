@@ -1,18 +1,2 @@
 
-This is just a placeholder readme
-
-### Header 
-
-Hello world readme text
-
-
-Some more text
-
-
-Some more text
-
-Some more text
-
-Some more text
-
-Some more text
+This is just a placeholder readme to add more context for examples

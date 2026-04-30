@@ -644,11 +644,54 @@ def track_video_realtime_v6(
         "infer_ms": 0.0,
         "mode": "init",
     }
-    latest_frame = {"bgr": None, "pos_s": None}
+    # latest_frame is the single-slot hand-off from reader/SPACE-handler
+    # to the inference thread.  `is_snapshot` distinguishes a paused-
+    # snapshot push (must be processed with all caches reset) from a
+    # streaming push (uses the FPS-optimized cached backbone).
+    latest_frame = {"bgr": None, "pos_s": None, "seq": 0,
+                    "is_snapshot": False}
     paused_state = {"v": False}
     running = {"active": True}
+    # Frame-to-result synchronization counter.  The reader and the
+    # SPACE/arrow-step handlers bump `req_seq` when they push a frame;
+    # the inference thread records the seq it consumed and writes
+    # `done_seq` after it lands the result.  push_snapshot_and_wait
+    # blocks until done_seq catches up to the snapshot's req_seq.
+    sync = {"req_seq": 0, "done_seq": 0}
 
     frame_interval = 1.0 / fps if not is_camera else 0
+
+    # --- snapshot sync helper ---
+    def push_snapshot_and_wait(frame_bgr, pos_s, timeout=1.0):
+        """Run a fresh, frame-aligned detection on `frame_bgr` and block
+        until the result is in `latest["result"]`.
+
+        Mechanism: tag the slot push with `is_snapshot=True`.  The
+        inference thread sees the tag at consume-time and (a) resets
+        ALL cross-frame state — backbone cache, encoder cache, tracker
+        state, id tracker — before processing, and (b) leaves the
+        caches empty afterwards so the post-pause first play frame is
+        also computed fresh.  This sidesteps the race where the in-
+        flight inference iteration's end-of-iter cache pre-fetch would
+        otherwise overwrite an externally-driven cache reset.
+
+        Pause is conceptually a fresh session: FPS optimizations don't
+        apply, every snapshot starts from a clean state.
+        """
+        with lock:
+            sync["req_seq"] += 1
+            target_seq = sync["req_seq"]
+            latest_frame["bgr"] = frame_bgr.copy()
+            latest_frame["pos_s"] = pos_s
+            latest_frame["seq"] = target_seq
+            latest_frame["is_snapshot"] = True
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            with lock:
+                if sync["done_seq"] >= target_seq:
+                    return True
+            time.sleep(0.005)
+        return False
 
     # --- reader ---
     def reader_loop():
@@ -671,15 +714,30 @@ def track_video_realtime_v6(
                 continue
             pos_s = (cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
                      if not is_camera else None)
+            # Atomic push: re-check paused INSIDE the lock.  If the user
+            # pressed SPACE after we cleared the top-of-loop check but
+            # before we got here, the SPACE handler is racing to put a
+            # snapshot in the slot — we must not clobber it.  The
+            # in-flight cap.read()'d frame gets dropped instead; on
+            # un-pause cap will pick up from the right position via the
+            # frame_buffer drain (see SPACE handler), so no real frames
+            # are lost in the user's perception.
             with lock:
+                if paused_state["v"]:
+                    continue
+                sync["req_seq"] += 1
                 latest_frame["bgr"] = frame
                 latest_frame["pos_s"] = pos_s
-            if frame_buffer.full():
-                try:
-                    frame_buffer.get_nowait()
-                except queue.Empty:
-                    pass
-            frame_buffer.put((frame, pos_s))
+                latest_frame["seq"] = sync["req_seq"]
+                latest_frame["is_snapshot"] = False  # streaming push
+                # Queue push lives inside the lock too so it's tied to
+                # the slot decision (both happen, or neither does).
+                if frame_buffer.full():
+                    try:
+                        frame_buffer.get_nowait()
+                    except queue.Empty:
+                        pass
+                frame_buffer.put((frame, pos_s))
             if not is_camera:
                 next_frame_time += frame_interval
 
@@ -696,10 +754,33 @@ def track_video_realtime_v6(
         while running["active"]:
             with lock:
                 latest_bgr = latest_frame["bgr"]
+                consumed_seq = latest_frame.get("seq", 0)
+                # `is_snapshot` is True when push_snapshot_and_wait set it
+                # (pause / arrow-step path); False for streaming reader
+                # pushes.  We capture it under the lock and clear it so
+                # any subsequent push starts fresh.
+                is_snapshot = latest_frame.get("is_snapshot", False)
                 latest_frame["bgr"] = None
+                latest_frame["is_snapshot"] = False
             if latest_bgr is None:
                 time.sleep(0.005)
                 continue
+
+            # On a snapshot, aggressively wipe ALL cross-frame state.
+            # Pause is conceptually a fresh session — none of the FPS
+            # optimizations (prefetched backbone features, tracker
+            # memory, persistent ID tracker) should leak influence
+            # from previous frames.  This is the deterministic
+            # mental model the user expects: "press SPACE → process
+            # this exact frame from scratch".
+            if is_snapshot:
+                backbone_cache["features"] = None
+                encoder_cache.clear()
+                tracker_state["memory_bank"] = []
+                tracker_state["n_objects"] = 0
+                tracker_state["labels"] = []
+                id_tracker = SimpleTracker()
+                prop_count = 0
 
             # Pick up prompt + threshold updates from the UI thread
             local_prompts = [prompts_state["fly"]]
@@ -771,11 +852,21 @@ def track_video_realtime_v6(
 
             dt = time.perf_counter() - t0
 
-            next_count = inference_count + 1
-            if (next_count % recompute_backbone_every == 0
-                    or next_count % detect_every == 0):
-                backbone_cache["features"] = _get_backbone_features(
-                    model, pixel_values)
+            # End-of-iter backbone pre-fetch (the upstream FPS
+            # optimization that pre-computes features for the NEXT
+            # frame using THIS frame's pixels).  Skip on snapshot:
+            # we don't want either the snapshot iteration OR the
+            # following one to reuse stale features.  The next frame
+            # (whether play resumes or another snapshot fires) will
+            # find features=None and compute fresh.
+            if not is_snapshot:
+                next_count = inference_count + 1
+                if (next_count % recompute_backbone_every == 0
+                        or next_count % detect_every == 0):
+                    backbone_cache["features"] = _get_backbone_features(
+                        model, pixel_values)
+            else:
+                backbone_cache["features"] = None
 
             result = id_tracker.update(result)
             with lock:
@@ -784,6 +875,12 @@ def track_video_realtime_v6(
                 latest["fps"] = 1.0 / max(dt, 1e-6)
                 latest["infer_ms"] = dt * 1000.0
                 latest["mode"] = mode
+                # Mark this seq as done.  max() so a stale slow compute
+                # never moves done_seq backwards if a fresher one already
+                # landed (shouldn't happen given single-threaded inference,
+                # but defensive against reordering).
+                if consumed_seq > sync["done_seq"]:
+                    sync["done_seq"] = consumed_seq
             inference_count += 1
 
     # --- mouse ---
@@ -1055,7 +1152,9 @@ def track_video_realtime_v6(
                 continue
 
             # --------- normal-mode keys ---------
-            # Arrow-step while paused
+            # Arrow-step while paused.  Also waits for inference to land
+            # the new frame's result so the first render after the step
+            # shows correctly-aligned masks (same fix as the SPACE pause).
             if paused_state["v"] and key in KEY_LEFT and not is_camera:
                 cur = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                 cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, cur - 2))
@@ -1063,9 +1162,7 @@ def track_video_realtime_v6(
                 if ret:
                     last_frame_bgr = fr
                     last_pos_s = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                    with lock:
-                        latest_frame["bgr"] = fr
-                        latest_frame["pos_s"] = last_pos_s
+                    push_snapshot_and_wait(fr, last_pos_s)
                     clear_analyze("frame step")
                 continue
             if paused_state["v"] and key in KEY_RIGHT and not is_camera:
@@ -1073,9 +1170,7 @@ def track_video_realtime_v6(
                 if ret:
                     last_frame_bgr = fr
                     last_pos_s = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                    with lock:
-                        latest_frame["bgr"] = fr
-                        latest_frame["pos_s"] = last_pos_s
+                    push_snapshot_and_wait(fr, last_pos_s)
                     clear_analyze("frame step")
                 continue
 
@@ -1085,19 +1180,23 @@ def track_video_realtime_v6(
             elif k == ord(" "):
                 paused_state["v"] = not paused_state["v"]
                 if paused_state["v"]:
-                    # Pause-snapshot: push the currently-displayed frame
-                    # back through inference so the *next* result is
-                    # guaranteed to be aligned with the frame on screen.
-                    # Without this the display can hold frame N while the
-                    # last computed result was for frame N+k (because the
-                    # inference thread always grabs the freshest, and the
-                    # display thread reads the FIFO queue in order).  See
-                    # the threading comment block at the top of the file.
+                    # Pause-snapshot + sync: push the displayed frame to
+                    # inference and BLOCK until the result lands for that
+                    # exact frame.  Without the wait, the next render
+                    # iteration would composite the new (held) frame with
+                    # the still-stale result and flash mismatched masks
+                    # for ~100 ms before inference catches up.
                     if last_frame_bgr is not None:
-                        with lock:
-                            latest_frame["bgr"] = last_frame_bgr.copy()
-                            latest_frame["pos_s"] = last_pos_s
+                        push_snapshot_and_wait(last_frame_bgr, last_pos_s)
                 else:
+                    # Drain the FIFO of any frames the reader pushed
+                    # before pause — otherwise unpause briefly replays
+                    # those old frames before catching up to "now".
+                    while not frame_buffer.empty():
+                        try:
+                            frame_buffer.get_nowait()
+                        except queue.Empty:
+                            break
                     clear_analyze("unpause")
                 print("[paused]" if paused_state["v"] else "[playing]")
             elif k == ord("m"):
