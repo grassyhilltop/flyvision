@@ -1,5 +1,5 @@
-Fly Vision  v0.1
-================
+Fly Vision Kit
+==============
 
 Live fruit-fly + wing detection on Apple Silicon.  Tracks flies in real
 time with SAM 3.1 (MLX) at ~20-30 FPS at 224 px on M-series hardware,
@@ -8,7 +8,13 @@ and runs a higher-resolution wing-measurement pass on demand.
 
 QUICK START
 -----------
-From the repo root:
+Easiest (no terminal): double-click `start.command` in the repo root.
+It opens a Terminal window and runs the live tracker on the bundled
+example video.  (Requires that you've already done the Setup steps
+below — Python deps installed and SAM 3.1 model in place.)  For the
+still-image analyzer demo, double-click `examples/run_static_image_analyzer.command`.
+
+From a terminal:
 
     cd code
     python run_realtime_tracker.py --video ../data/input/your_fly_video.mp4

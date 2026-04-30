@@ -147,6 +147,7 @@ STATUS_COLORS = {  # BGR
     "PAUSED":    (140, 140, 150),
     "ANALYZING": (255, 180, 60),
     "ANALYZED":  (255, 220, 100),
+    "SAVING":    (90, 220, 90),    # bright green — visible flash on [s]
     "INIT":      (160, 160, 160),
 }
 
@@ -307,7 +308,7 @@ def _assign_wings_to_flies(fly_masks, wing_masks):
 # Annotation pipeline (mostly unchanged from v4; ROI ring now translucent)
 # ---------------------------------------------------------------------------
 
-def annotate_v6(frame_bgr, result, fly_prompt, wing_prompt, mode, roi,
+def annotate_frame_for_display(frame_bgr, result, fly_prompt, wing_prompt, mode, roi,
                 px_per_mm, disp_W, disp_H,
                 fly_alpha=0.10, wing_alpha=0.16, dim_alpha=0.65,
                 roi_alpha=0.65,
@@ -578,7 +579,7 @@ def annotate_v6(frame_bgr, result, fly_prompt, wing_prompt, mode, roi,
 # Main
 # ---------------------------------------------------------------------------
 
-def track_video_realtime_v6(
+def _run_tracker_loop(
     video_path: str,
     fly_prompt_init: str,
     wing_prompt_init: str,
@@ -672,6 +673,40 @@ def track_video_realtime_v6(
 
     frame_buffer = queue.Queue(maxsize=10)
     lock = threading.Lock()
+
+    # Foveation: in focus mode, the inference thread crops the frame
+    # to the ROI before processing instead of feeding the whole frame.
+    # The SAM forward pass cost is fixed by image_size (e.g. 224x224)
+    # so the per-frame ViT cost doesn't change much, but the fly fills
+    # a much larger fraction of the model input → significantly cleaner
+    # masks at the same `--resolution`.  Also slightly faster pre/post
+    # processing (smaller native frame to convert + upsample).
+    # `mode` and `roi` here mirror the main thread's local state so the
+    # inference thread can see updates atomically under the lock.
+    # Declared HERE (not later in the function) so the publish_foveation
+    # closure below has a bound name to read on its first call —
+    # otherwise Python's compiler treats foveation_state as a still-
+    # unassigned local of the enclosing function and the call below
+    # raises "free variable ... referenced before assignment".
+    foveation_state = {
+        "mode": MODES[0],          # focus / full / no-labels
+        "roi": None,               # (cx, cy, radius) in native coords
+        "pad_factor": 1.4,         # crop = ROI bbox * this (extra room
+                                   # so masks aren't cut off at the edge)
+    }
+
+    def publish_foveation():
+        """Mirror the main thread's `mode_idx` + `roi` into the shared
+        foveation_state dict.  Call after any mutation of the local
+        state so the inference thread sees the change on its next
+        iteration."""
+        with lock:
+            foveation_state["mode"] = MODES[mode_idx]
+            foveation_state["roi"] = tuple(roi)
+
+    # Seed shared state with the startup values so the inference thread
+    # finds a valid ROI on its very first iteration.
+    publish_foveation()
     empty_result = DetectionResult(
         boxes=np.zeros((0, 4)),
         masks=np.zeros((0, H, W), dtype=np.uint8),
@@ -699,6 +734,8 @@ def track_video_realtime_v6(
     # `done_seq` after it lands the result.  push_snapshot_and_wait
     # blocks until done_seq catches up to the snapshot's req_seq.
     sync = {"req_seq": 0, "done_seq": 0}
+    # foveation_state is declared earlier (above publish_foveation) so
+    # the closure has a bound name on first use.
 
     frame_interval = 1.0 / fps if not is_camera else 0
 
@@ -803,6 +840,11 @@ def track_video_realtime_v6(
                 is_snapshot = latest_frame.get("is_snapshot", False)
                 latest_frame["bgr"] = None
                 latest_frame["is_snapshot"] = False
+                # Snapshot of foveation state under the same lock so the
+                # ROI we read matches the frame we just consumed.
+                fov_mode = foveation_state["mode"]
+                fov_roi = foveation_state["roi"]
+                fov_pad = foveation_state["pad_factor"]
             if latest_bgr is None:
                 time.sleep(0.005)
                 continue
@@ -835,8 +877,37 @@ def track_video_realtime_v6(
                 backbone_cache["features"] = None
                 prompts_state["dirty"] = False
 
+            # ----- Foveation: crop frame to ROI in focus mode --------
+            # The fly fills more of the SAM input → cleaner masks at
+            # the same `--resolution`.  We track the crop origin so we
+            # can paste the resulting masks back into a full-frame
+            # canvas before downstream rendering.  Disabled in full /
+            # no-labels mode (we want the whole scene processed there).
+            full_H, full_W = latest_bgr.shape[:2]
+            crop_origin = None  # (x0, y0) in native coords, or None
+            if fov_mode == "focus" and fov_roi is not None:
+                cx, cy, r = fov_roi
+                half = r * fov_pad
+                x0 = max(0, int(cx - half))
+                y0 = max(0, int(cy - half))
+                x1 = min(full_W, int(cx + half))
+                y1 = min(full_H, int(cy + half))
+                # Skip foveation if the resulting crop is degenerate
+                # (would just slow us down with no benefit).
+                if x1 - x0 >= 64 and y1 - y0 >= 64:
+                    proc_bgr = latest_bgr[y0:y1, x0:x1]
+                    crop_origin = (x0, y0)
+                    # ROI moved (or first frame) → caches are for the
+                    # previous crop, must be reset for fresh detection.
+                    backbone_cache["features"] = None
+                    encoder_cache.clear()
+                else:
+                    proc_bgr = latest_bgr
+            else:
+                proc_bgr = latest_bgr
+
             t0 = time.perf_counter()
-            frame_pil = Image.fromarray(cv2.cvtColor(latest_bgr,
+            frame_pil = Image.fromarray(cv2.cvtColor(proc_bgr,
                                                     cv2.COLOR_BGR2RGB))
             image_size = frame_pil.size
             inputs = predictor.processor.preprocess_image(frame_pil)
@@ -847,10 +918,17 @@ def track_video_realtime_v6(
                     model, pixel_values)
             backbone_features = backbone_cache["features"]
 
+            # When foveation is active the crop position changes any
+            # time the ROI moves, so the tracker's memory bank (which
+            # is tied to a specific crop region) is no longer valid.
+            # Force detection-every-frame in this mode; we lose the
+            # propagation FPS optimization but at 224 px (the typical
+            # foveation use case) propagation is dormant anyway.
             can_track = (
                 resolution >= 1008
                 and tracker_state["memory_bank"]
                 and tracker_state["n_objects"] > 0
+                and crop_origin is None
             )
             need_detect = (
                 inference_count % detect_every == 0
@@ -893,14 +971,33 @@ def track_video_realtime_v6(
 
             dt = time.perf_counter() - t0
 
+            # If foveated, masks + boxes came back in CROP coordinates.
+            # Translate them into full-frame coordinates so the rest of
+            # the pipeline (annotate_frame_for_display, focus filter, save, CSV) can
+            # treat the result as if it had come from a regular full-
+            # frame inference pass.  Cost: a few np.zeros allocs + an
+            # array slice copy per detection.  Fast.
+            if crop_origin is not None and len(result.scores) > 0:
+                x0, y0 = crop_origin
+                crop_h, crop_w = proc_bgr.shape[:2]
+                # paste each mask into a full-frame zero canvas
+                pasted = np.zeros((len(result.masks), full_H, full_W),
+                                  dtype=result.masks.dtype)
+                pasted[:, y0:y0 + crop_h, x0:x0 + crop_w] = result.masks
+                result.masks = pasted
+                # shift bbox coords from crop space to native space
+                if len(result.boxes):
+                    result.boxes = result.boxes.copy()
+                    result.boxes[:, [0, 2]] += x0
+                    result.boxes[:, [1, 3]] += y0
+
             # End-of-iter backbone pre-fetch (the upstream FPS
             # optimization that pre-computes features for the NEXT
-            # frame using THIS frame's pixels).  Skip on snapshot:
-            # we don't want either the snapshot iteration OR the
-            # following one to reuse stale features.  The next frame
-            # (whether play resumes or another snapshot fires) will
-            # find features=None and compute fresh.
-            if not is_snapshot:
+            # frame using THIS frame's pixels).  Skip on snapshot OR
+            # foveation: pre-fetched features are tied to *these*
+            # pixels, but the next frame might be a different crop
+            # (ROI moved) or a fresh post-pause frame.
+            if not is_snapshot and crop_origin is None:
                 next_count = inference_count + 1
                 if (next_count % recompute_backbone_every == 0
                         or next_count % detect_every == 0):
@@ -985,7 +1082,7 @@ def track_video_realtime_v6(
         last_frame_bgr = None
         last_pos_s = None
 
-        # Annotation cache.  annotate_v6 is the expensive thing in the loop
+        # Annotation cache.  annotate_frame_for_display is the expensive thing in the loop
         # (~30 ms at 1920x1080); when nothing relevant has changed (e.g. user
         # is typing characters into the prompt editor on a paused frame),
         # reuse the previous canvas and only re-render the cheap bar/HUD.
@@ -1051,7 +1148,7 @@ def track_video_realtime_v6(
                 n_fly = ann_cache["n_fly"]
                 n_wing = ann_cache["n_wing"]
             else:
-                annotated, n_fly, n_wing = annotate_v6(
+                annotated, n_fly, n_wing = annotate_frame_for_display(
                     frame_bgr, draw_result,
                     prompts_state["fly"], prompts_state["wing"],
                     mode, tuple(roi), px_per_mm_state["v"],
@@ -1117,8 +1214,16 @@ def track_video_realtime_v6(
                         print(f"[calib] p2 = ({nx:.1f}, {ny:.1f})")
                     elif mode == "focus":
                         roi[0] = float(nx); roi[1] = float(ny)
+                        publish_foveation()
                         if analyze_state["v"] != "idle":
                             clear_analyze("ROI moved")
+                        # When paused, the live result was computed
+                        # for the OLD crop region — re-fire inference
+                        # for the new ROI so the user sees the new
+                        # contours immediately.
+                        if paused_state["v"] and last_frame_bgr is not None:
+                            push_snapshot_and_wait(last_frame_bgr,
+                                                    last_pos_s)
 
             key = cv2.waitKeyEx(1)
             if key == -1:
@@ -1242,11 +1347,20 @@ def track_video_realtime_v6(
                 print("[paused]" if paused_state["v"] else "[playing]")
             elif k == ord("m"):
                 mode_idx = (mode_idx + 1) % len(MODES)
+                publish_foveation()
                 print(f"mode = {MODES[mode_idx]}")
             elif k == ord("9"):
                 roi[2] = max(40.0, roi[2] * 0.9)
+                publish_foveation()
+                if paused_state["v"] and last_frame_bgr is not None \
+                        and MODES[mode_idx] == "focus":
+                    push_snapshot_and_wait(last_frame_bgr, last_pos_s)
             elif k == ord("0"):
                 roi[2] = min(0.6 * H, roi[2] * 1.1)
+                publish_foveation()
+                if paused_state["v"] and last_frame_bgr is not None \
+                        and MODES[mode_idx] == "focus":
+                    push_snapshot_and_wait(last_frame_bgr, last_pos_s)
             elif k in (ord("="), ord("+")):
                 threshold_state["v"] = min(0.95, round(
                     threshold_state["v"] + 0.05, 2))
@@ -1283,6 +1397,20 @@ def track_video_realtime_v6(
                 cv2.waitKey(1)
                 run_analyze(last_frame_bgr)
             elif k == ord("s"):
+                # Flash a green SAVING badge so the user gets visual
+                # confirmation that the save fired.  We pre-paint the
+                # bar with the new badge before doing the file I/O,
+                # then enforce a small minimum on-screen duration so
+                # the flash is visible even when the save is fast.
+                save_t0 = time.perf_counter()
+                pre_bar = render_control_bar(
+                    disp_W, prompts_state["fly"], prompts_state["wing"],
+                    MODE_DESCRIPTIONS[mode], "SAVING",
+                    inf_fps, inf_ms, n_fly,
+                    threshold_state["v"], resolution)
+                cv2.imshow(WINDOW_TITLE, np.vstack([pre_bar, annotated]))
+                cv2.waitKey(1)
+
                 save_counter += 1
                 image_name = f"{session_prefix}_{save_counter:04d}.png"
                 outpath = out_dir / image_name
@@ -1323,6 +1451,10 @@ def track_video_realtime_v6(
                 else:
                     print(f"[save] wrote {outpath}  (+{n} rows, "
                           f"scene-local ids 1..{n})")
+                # Hold the badge on screen long enough to be perceived.
+                elapsed = time.perf_counter() - save_t0
+                if elapsed < 0.30:
+                    time.sleep(0.30 - elapsed)
 
         running["active"] = False
 
@@ -1384,7 +1516,7 @@ def main():
 
     video = args.video if args.video is not None else "0"
 
-    track_video_realtime_v6(
+    _run_tracker_loop(
         video,
         args.prompt,
         args.wing_prompt,
