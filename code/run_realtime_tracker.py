@@ -93,6 +93,47 @@ VERSION = "0.1"
 WINDOW_TITLE = "Fly Vision Realtime"
 BAR_H = 60   # 2 rows: prompts/badge/metrics on top, keys + thr/res/mode below
 
+# --- Resolution grid constraint --------------------------------------------
+#
+# Empirically, --resolution (and --analyze-resolution) must be a multiple
+# of 112 = 16 × 7.  Other values (e.g. 384, 512) cause the live tracker
+# masks to land ~5-10 px to the right of the actual fly position on a
+# 16:9 source frame.
+#
+# Why: SAM 3.1's ViT uses 16-px patches and was trained at a 14×14
+# patch grid (224 px) and its 7-multiple expansions (672, 1008, …),
+# so the internal feature maps assume a patch count that's a multiple
+# of 7.  When image_size isn't on this grid the model silently rounds
+# internally while our upsample still uses the user-requested
+# dimensions — and the asymmetric scale-back to a 16:9 native frame
+# amplifies the resulting alignment error horizontally.
+#
+# Tested-aligned:    224, 448, 672, 1008
+# Should be safe (multiples of 112, untested):  336, 560, 784, 896, 1120
+# Tested-misaligned: 384, 512
+SAFE_RESOLUTIONS = (224, 336, 448, 560, 672, 784, 896, 1008, 1120)
+RESOLUTION_GRID = 112
+
+
+def warn_if_offgrid(value, name):
+    """Print a warning if `value` isn't a multiple of `RESOLUTION_GRID`.
+    Doesn't modify the value — passing on-purpose still works, the user
+    just gets a heads-up about the alignment artifact."""
+    if value % RESOLUTION_GRID == 0:
+        return
+    below = (value // RESOLUTION_GRID) * RESOLUTION_GRID
+    above = below + RESOLUTION_GRID
+    suggestions = [v for v in (below, above) if v >= 112]
+    print(f"[warn] {name}={value} is not a multiple of "
+          f"{RESOLUTION_GRID} — live tracker masks may be horizontally "
+          f"offset by ~5-10 px from the actual fly position.")
+    print(f"       Suggested values (multiples of {RESOLUTION_GRID}): "
+          f"{', '.join(str(v) for v in SAFE_RESOLUTIONS)}.")
+    if suggestions:
+        print(f"       Nearest to {value}: "
+              f"{' or '.join(str(v) for v in suggestions)}.")
+# ---------------------------------------------------------------------------
+
 MODES = ["focus", "full", "no-labels"]
 MODE_DESCRIPTIONS = {
     "focus": "focus (ROI)",
@@ -1334,6 +1375,12 @@ def main():
     parser.add_argument("--output-dir", default="../data/output",
                         help="folder for saved PNGs + CSV (data/ subfolder)")
     args = parser.parse_args()
+
+    # Resolution grid sanity check — see SAFE_RESOLUTIONS / warn_if_offgrid
+    # for the rationale.  We only warn (don't modify), since the user can
+    # explicitly opt into a non-grid value if they want to test it.
+    warn_if_offgrid(args.resolution, "--resolution")
+    warn_if_offgrid(args.analyze_resolution, "--analyze-resolution")
 
     video = args.video if args.video is not None else "0"
 
